@@ -4,20 +4,21 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const cors = require('cors');
+const os = require('os');
 
 const app = express();
-const PORT = process.env.PORT || 8080; 
+const PORT = process.env.PORT || 8080;
 
 app.use(cors());
 app.use(express.json());
 
-// PERBAIKAN: Membuat folder secara internal melalui Node.js (lebih aman di Railway)
+// Pembuatan folder internal untuk menghindari 'npm error path'
 const uploadDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) {
     try {
         fs.mkdirSync(uploadDir, { recursive: true });
-    } catch (err) {
-        console.error("Gagal membuat folder uploads:", err);
+    } catch (e) {
+        console.error("Folder error:", e);
     }
 }
 
@@ -25,19 +26,38 @@ app.use('/uploads', express.static(uploadDir));
 
 const activeStreams = {};
 
+// Konfigurasi Multer
 const storage = multer.diskStorage({
     destination: (req, file, cb) => cb(null, uploadDir),
     filename: (req, file, cb) => cb(null, Date.now() + '-' + file.originalname)
 });
 const upload = multer({ storage: storage });
 
-// Fitur Auto-Delete: Menghapus file video setelah stream dimatikan
-function cleanupVideo(filePath) {
-    fs.unlink(filePath, (err) => {
-        if (err) console.error("Gagal menghapus file:", err);
-        else console.log("File sampah berhasil dibersihkan:", filePath);
+// Endpoint Monitoring Sistem
+app.get('/system-stats', (req, res) => {
+    const freeMem = os.freemem();
+    const totalMem = os.totalmem();
+    res.json({
+        cpuUsage: os.loadavg()[0].toFixed(2), // Load average 1 menit
+        ramUsage: (((totalMem - freeMem) / totalMem) * 100).toFixed(2),
+        uptime: os.uptime()
     });
+});
+
+// Fitur Auto-Delete
+function cleanupVideo(filePath) {
+    if (fs.existsSync(filePath)) {
+        fs.unlink(filePath, (err) => {
+            if (err) console.error("Cleanup error:", err);
+            else console.log("Video deleted:", filePath);
+        });
+    }
 }
+
+app.post('/upload-video', upload.single('video'), (req, res) => {
+    if (!req.file) return res.status(400).json({ success: false });
+    res.json({ success: true, videoUrl: req.file.path });
+});
 
 app.post('/start-stream', (req, res) => {
     const { sessionId, streamUrl, streamKey, videoPath, resolution, bitrate, platform } = req.body;
@@ -49,8 +69,8 @@ app.post('/start-stream', (req, res) => {
         '-re', '-stream_loop', '-1',
         '-i', videoPath,
         '-s', resMap[resolution] || "1280x720",
-        '-c:v', 'libx264', '-preset', 'veryfast',
-        '-b:v', bitrate, '-maxrate', bitrate, '-bufsize', '4000k',
+        '-c:v', 'libx264', '-preset', 'ultrafast',
+        '-b:v', bitrate, '-maxrate', bitrate, '-bufsize', '3000k',
         '-pix_fmt', 'yuv420p', '-g', '50',
         '-c:a', 'aac', '-b:a', '128k',
         '-f', 'flv', `${streamUrl}${streamKey}`
@@ -59,15 +79,12 @@ app.post('/start-stream', (req, res) => {
     const proc = spawn('ffmpeg', ffmpegArgs);
 
     if (!activeStreams[sessionId]) activeStreams[sessionId] = {};
-    
     activeStreams[sessionId][streamId] = {
         process: proc,
         metadata: { streamId, platform, resolution, bitrate, startTime: new Date(), videoPath }
     };
 
     proc.on('close', () => {
-        console.log(`Stream ${streamId} berhenti.`);
-        // File dihapus otomatis saat stream mati agar disk tidak penuh
         if (activeStreams[sessionId] && activeStreams[sessionId][streamId]) {
             cleanupVideo(activeStreams[sessionId][streamId].metadata.videoPath);
             delete activeStreams[sessionId][streamId];
@@ -81,17 +98,16 @@ app.post('/stop-stream', (req, res) => {
     const { sessionId, streamId } = req.body;
     if (activeStreams[sessionId] && activeStreams[sessionId][streamId]) {
         activeStreams[sessionId][streamId].process.kill('SIGKILL');
-        // cleanupVideo akan dipicu oleh event 'close' di atas
-        return res.json({ success: true });
+        res.json({ success: true });
+    } else {
+        res.json({ success: false });
     }
-    res.json({ success: false });
 });
 
 app.get('/stream-status/:sessionId', (req, res) => {
     const session = activeStreams[req.params.sessionId];
-    const streamList = session ? Object.values(session).map(s => s.metadata) : [];
-    res.json({ success: true, streams: streamList });
+    res.json({ success: true, streams: session ? Object.values(session).map(s => s.metadata) : [] });
 });
 
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`Server live on port ${PORT}`));
 

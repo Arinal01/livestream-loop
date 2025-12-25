@@ -12,21 +12,15 @@ const PORT = process.env.PORT || 8080;
 app.use(cors());
 app.use(express.json());
 
-// 1. Endpoint Root (PENTING untuk Health Check Railway)
-app.get('/', (req, res) => {
-    res.status(200).send("SERVER RUNNING SECURELY");
-});
+app.get('/', (req, res) => res.status(200).send("SERVER LIVE"));
 
-// 2. Folder Uploads Internal
 const uploadDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadDir)) {
-    fs.mkdirSync(uploadDir, { recursive: true });
-}
-
+if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
 app.use('/uploads', express.static(uploadDir));
+
+// Objek untuk menyimpan data stream berdasarkan SessionID
 const activeStreams = {};
 
-// 3. Endpoint Monitoring (Untuk Website Anda)
 app.get('/system-stats', (req, res) => {
     res.json({
         cpuUsage: (os.loadavg()[0] * 10).toFixed(2),
@@ -38,12 +32,15 @@ app.get('/system-stats', (req, res) => {
 
 const upload = multer({ dest: 'uploads/' });
 
-// 4. Endpoint Start Stream
-app.post('/start-stream', upload.single('video'), (req, res) => {
+// Upload Endpoint
+app.post('/upload-video', upload.single('video'), (req, res) => {
     if (!req.file) return res.status(400).json({ success: false });
+    res.json({ success: true, videoUrl: req.file.path });
+});
 
-    const { streamUrl, streamKey, resolution, bitrate } = req.body;
-    const videoPath = req.file.path;
+// Start Stream Endpoint
+app.post('/start-stream', (req, res) => {
+    const { sessionId, streamUrl, streamKey, videoPath, resolution, bitrate, platform } = req.body;
     const streamId = Date.now().toString();
 
     const ffmpegArgs = [
@@ -54,17 +51,39 @@ app.post('/start-stream', upload.single('video'), (req, res) => {
     ];
 
     const proc = spawn('ffmpeg', ffmpegArgs);
-    activeStreams[streamId] = { process: proc, videoPath };
+
+    // Simpan ke memory berdasarkan session
+    if (!activeStreams[sessionId]) activeStreams[sessionId] = {};
+    activeStreams[sessionId][streamId] = {
+        process: proc,
+        metadata: { streamId, platform, resolution, bitrate, startTime: new Date(), videoPath }
+    };
 
     proc.on('close', () => {
         if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
-        delete activeStreams[streamId];
+        if (activeStreams[sessionId]) delete activeStreams[sessionId][streamId];
     });
 
     res.json({ success: true, streamId });
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`SERVER LIVE STREAM PRO RUNNING ON PORT ${PORT}`);
+// Status Endpoint (DIBUTUHKAN WEBSITE)
+app.get('/stream-status/:sessionId', (req, res) => {
+    const session = activeStreams[req.params.sessionId];
+    const streamList = session ? Object.values(session).map(s => s.metadata) : [];
+    res.json({ success: true, streams: streamList });
 });
+
+// Stop Stream Endpoint
+app.post('/stop-stream', (req, res) => {
+    const { sessionId, streamId } = req.body;
+    if (activeStreams[sessionId] && activeStreams[sessionId][streamId]) {
+        activeStreams[sessionId][streamId].process.kill('SIGKILL');
+        res.json({ success: true });
+    } else {
+        res.json({ success: false });
+    }
+});
+
+app.listen(PORT, '0.0.0.0', () => console.log(`SERVER RUNNING ON PORT ${PORT}`));
 

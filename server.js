@@ -7,92 +7,129 @@ const fs = require('fs');
 const path = require('path');
 
 dotenv.config();
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Pastikan folder uploads ada
 const uploadDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
+if (!fs.existsSync(uploadDir)) {
+    fs.mkdirSync(uploadDir);
+}
 
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, 'uploads/'),
-  filename: (req, file, cb) => cb(null, Date.now() + '-' + file.originalname)
+    destination: (req, file, cb) => cb(null, 'uploads/'),
+    filename: (req, file, cb) => cb(null, Date.now() + '-' + file.originalname)
 });
 const upload = multer({ storage: storage });
 
-app.use(cors());
+// Konfigurasi CORS yang lebih kuat
+app.use(cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
 app.use(express.json());
 app.use('/uploads', express.static('uploads'));
 
+// Memory storage untuk stream aktif
 const activeStreams = {};
 
-// 1. ENDPOINT UPLOAD
+// Endpoint Upload
 app.post('/upload-video', upload.single('video'), (req, res) => {
-  if (!req.file) return res.status(400).json({ success: false, message: 'File kosong.' });
-  // Path absolut untuk FFmpeg
-  const videoPath = path.join(__dirname, 'uploads', req.file.filename);
-  res.json({ success: true, videoUrl: videoPath });
+    if (!req.file) return res.status(400).json({ success: false, message: 'No file.' });
+    // Gunakan path absolute untuk FFmpeg agar lebih aman di Railway
+    const videoPath = path.join(__dirname, 'uploads', req.file.filename);
+    res.json({ 
+        success: true, 
+        videoUrl: videoPath,
+        fileName: req.file.originalname 
+    });
 });
 
-// 2. ENDPOINT START (MULTI-CHANNEL)
+// Endpoint Start Stream (Mendukung Multi-Key)
 app.post('/start-stream', (req, res) => {
-  const { sessionId, streamUrl, streamKeys, videoPath, autoReconnect } = req.body;
+    const { sessionId, streamUrl, streamKeys, videoPath, bitrate = '3000k' } = req.body;
 
-  if (activeStreams[sessionId]) return res.json({ success: false, message: 'Stream sedang berjalan.' });
-
-  // Ubah single key atau array keys menjadi format TEE FFmpeg
-  // Contoh: [f=flv]rtmp1|[f=flv]rtmp2
-  const outputs = streamKeys.map(key => `[f=flv]${streamUrl}/${key}`).join('|');
-
-  const ffmpegArgs = [
-    '-re',
-    '-stream_loop', '-1', // Looping selamanya
-    '-i', videoPath,
-    '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', '2500k',
-    '-maxrate', '2500k', '-bufsize', '5000k',
-    '-pix_fmt', 'yuv420p', '-g', '50',
-    '-c:a', 'aac', '-b:a', '128k', '-ar', '44100',
-    '-f', 'tee', // Menggunakan protocol TEE untuk multi-output
-    '-map', '0:v:0', '-map', '0:a:0',
-    outputs
-  ];
-
-  const ffmpegProcess = spawn('ffmpeg', ffmpegArgs);
-
-  activeStreams[sessionId] = {
-    process: ffmpegProcess,
-    startTime: new Date(),
-    keys: streamKeys
-  };
-
-  ffmpegProcess.stderr.on('data', (data) => {
-    console.log(`[FFmpeg ${sessionId}]: ${data}`);
-  });
-
-  ffmpegProcess.on('close', (code) => {
-    console.log(`[Stream ${sessionId}] Berhenti. Code: ${code}`);
-    delete activeStreams[sessionId];
-    
-    // Logika Auto Reconnect Sederhana
-    if (autoReconnect && code !== 0) {
-        console.log(`[${sessionId}] Reconnecting...`);
-        // Trigger restart logic here if needed
+    if (!sessionId || !streamUrl || !streamKeys || !videoPath) {
+        return res.status(400).json({ success: false, message: 'Data tidak lengkap.' });
     }
-  });
 
-  res.json({ success: true, message: 'Multi-stream dimulai!' });
+    if (activeStreams[sessionId]) {
+        return res.status(400).json({ success: false, message: 'Stream sedang berjalan.' });
+    }
+
+    const processes = [];
+    const keys = Array.isArray(streamKeys) ? streamKeys : [streamKeys];
+
+    // Jalankan satu proses FFmpeg untuk setiap stream key
+    keys.forEach(key => {
+        const ffmpegProcess = spawn('ffmpeg', [
+            '-re',
+            '-stream_loop', '-1',
+            '-i', videoPath,
+            '-c:v', 'libx264',
+            '-preset', 'veryfast',
+            '-b:v', bitrate,
+            '-maxrate', bitrate,
+            '-bufsize', '6000k',
+            '-pix_fmt', 'yuv420p',
+            '-g', '50',
+            '-c:a', 'aac',
+            '-b:a', '128k',
+            '-f', 'flv',
+            `${streamUrl}${key}`
+        ]);
+
+        ffmpegProcess.stderr.on('data', (data) => console.log(`[${sessionId}] FFmpeg: ${data}`));
+        
+        ffmpegProcess.on('close', () => {
+            console.log(`[${sessionId}] Stream key ${key} closed.`);
+        });
+
+        processes.push(ffmpegProcess);
+    });
+
+    activeStreams[sessionId] = {
+        processes: processes,
+        startTime: new Date(),
+        channelCount: keys.length,
+        videoPath: videoPath
+    };
+
+    res.json({ success: true, channelCount: keys.length });
 });
 
-// 3. ENDPOINT STOP
+// Endpoint Status (Untuk Sinkronisasi saat Refresh)
+app.get('/stream-status/:sessionId', (req, res) => {
+    const { sessionId } = req.params;
+    const stream = activeStreams[sessionId];
+
+    if (stream) {
+        res.json({ 
+            success: true, 
+            isActive: true, 
+            startTime: stream.startTime,
+            channelCount: stream.channelCount 
+        });
+    } else {
+        res.json({ success: true, isActive: false });
+    }
+});
+
+// Endpoint Stop
 app.post('/stop-stream', (req, res) => {
-  const { sessionId } = req.body;
-  if (activeStreams[sessionId]) {
-    activeStreams[sessionId].process.kill('SIGKILL');
-    delete activeStreams[sessionId];
-    return res.json({ success: true });
-  }
-  res.status(404).json({ success: false });
+    const { sessionId } = req.body;
+    if (activeStreams[sessionId]) {
+        activeStreams[sessionId].processes.forEach(p => p.kill('SIGKILL'));
+        delete activeStreams[sessionId];
+        return res.json({ success: true });
+    }
+    res.json({ success: false });
 });
 
-app.listen(PORT, () => console.log(`Backend siap di port ${PORT}`));
+app.get('/', (req, res) => res.send('K-TOOL Backend Active'));
+
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 

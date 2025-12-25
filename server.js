@@ -1,6 +1,6 @@
 const express = require('express');
 const multer = require('multer'); // Untuk menangani upload file
-const { spawn, exec } = require('child_process'); // Untuk menjalankan FFmpeg
+const { spawn } = require('child_process'); // Untuk menjalankan FFmpeg
 const cors = require('cors'); // Untuk mengizinkan permintaan dari frontend kamu
 const dotenv = require('dotenv'); // Untuk membaca variabel lingkungan
 
@@ -15,21 +15,22 @@ const storage = multer.diskStorage({
     cb(null, 'uploads/'); // Simpan video di folder 'uploads'
   },
   filename: function (req, file, cb) {
-    // Memberi nama file unik agar tidak bentrok
     cb(null, Date.now() + '-' + file.originalname);
   }
 });
 const upload = multer({ storage: storage });
 
-// Aktifkan CORS untuk mengizinkan frontend mengakses API ini
+// Aktifkan CORS
 app.use(cors());
-// Middleware untuk parse JSON body pada request
+// Middleware untuk parse JSON body
 app.use(express.json());
-// Serve static files from 'uploads' directory
+// Serve static files
 app.use('/uploads', express.static('uploads'));
 
-// Objek untuk menyimpan detail stream yang sedang berjalan
-// Kunci adalah session ID atau user ID, nilai adalah objek proses FFmpeg
+/**
+ * Objek untuk menyimpan detail stream yang sedang berjalan.
+ * Sekarang menyimpan objek berisi proses FFmpeg dan metadata video.
+ */
 const activeStreams = {}; 
 
 // Endpoint untuk mengunggah video
@@ -37,57 +38,66 @@ app.post('/upload-video', upload.single('video'), (req, res) => {
   if (!req.file) {
     return res.status(400).json({ success: false, message: 'Tidak ada file yang diunggah.' });
   }
-  const videoPath = `/app/uploads/${req.file.filename}`; // Path di dalam container
-  res.json({ success: true, message: 'Video berhasil diunggah.', videoUrl: videoPath });
+  const videoPath = `/app/uploads/${req.file.filename}`; 
+  res.json({ 
+    success: true, 
+    message: 'Video berhasil diunggah.', 
+    videoUrl: videoPath,
+    originalName: req.file.originalname // Kirim balik nama asli untuk disimpan di frontend
+  });
 });
 
 // Endpoint untuk memulai stream
 app.post('/start-stream', (req, res) => {
-  const { sessionId, streamUrl, streamKey, videoPath, bitrate = '3000k' } = req.body;
+  const { sessionId, streamUrl, streamKey, videoPath, videoName, bitrate = '3000k' } = req.body;
 
   if (!sessionId || !streamUrl || !streamKey || !videoPath) {
     return res.status(400).json({ success: false, message: 'Data yang diperlukan tidak lengkap.' });
   }
 
   if (activeStreams[sessionId]) {
-    return res.status(400).json({ success: false, message: 'Stream untuk sesi ini sudah berjalan. Hentikan dulu.' });
+    return res.status(400).json({ success: false, message: 'Stream untuk sesi ini sudah berjalan.' });
   }
 
-  console.log(`[${sessionId}] Starting FFmpeg for video: ${videoPath} to ${streamUrl}/${streamKey}`);
+  console.log(`[${sessionId}] Starting FFmpeg: ${videoPath}`);
 
   const ffmpegProcess = spawn('ffmpeg', [
-    '-re',                 // Membaca input pada native frame rate
-    '-stream_loop', '-1',  // Loop video tanpa henti
-    '-i', videoPath,       // Input video dari path yang diunggah
-    '-c:v', 'libx264',     // Codec video H.264
-    '-preset', 'veryfast', // Preset encoding cepat
-    '-b:v', bitrate,       // Video bitrate
-    '-maxrate', bitrate,   // Max video bitrate
-    '-bufsize', '6000k',   // Buffer size
-    '-pix_fmt', 'yuv420p', // Pixel format
-    '-g', '50',            // GOP size
-    '-c:a', 'aac',         // Codec audio AAC
-    '-b:a', '128k',        // Audio bitrate
-    '-f', 'flv',           // Format output FLV (untuk RTMP)
-    `${streamUrl}/${streamKey}` // URL dan kunci stream tujuan
+    '-re',
+    '-stream_loop', '-1',
+    '-i', videoPath,
+    '-c:v', 'libx264',
+    '-preset', 'veryfast',
+    '-b:v', bitrate,
+    '-maxrate', bitrate,
+    '-bufsize', '6000k',
+    '-pix_fmt', 'yuv420p',
+    '-g', '50',
+    '-c:a', 'aac',
+    '-b:a', '128k',
+    '-f', 'flv',
+    `${streamUrl}/${streamKey}`
   ]);
+
+  // Simpan proses dan metadata ke memori server
+  activeStreams[sessionId] = {
+    process: ffmpegProcess,
+    videoName: videoName || "Live Stream", // Menyimpan nama video agar tidak hilang saat refresh
+    startTime: new Date()
+  };
 
   ffmpegProcess.stderr.on('data', (data) => {
     console.log(`[FFmpeg ${sessionId} ERR]: ${data}`);
-    // Kamu bisa menyimpan log ini ke database atau mengirim ke frontend via WebSocket
   });
 
   ffmpegProcess.on('close', (code) => {
-    console.log(`[FFmpeg ${sessionId}] child process exited with code ${code}`);
-    delete activeStreams[sessionId]; // Hapus dari daftar stream aktif
+    console.log(`[FFmpeg ${sessionId}] exited with code ${code}`);
+    delete activeStreams[sessionId]; 
   });
 
   ffmpegProcess.on('error', (err) => {
-    console.error(`[FFmpeg ${sessionId}] Failed to start FFmpeg process: ${err.message}`);
+    console.error(`[FFmpeg ${sessionId}] Error: ${err.message}`);
     delete activeStreams[sessionId];
   });
-
-  activeStreams[sessionId] = ffmpegProcess; // Simpan proses FFmpeg yang aktif
 
   res.json({ success: true, message: 'Live stream berhasil dimulai!', sessionId: sessionId });
 });
@@ -96,31 +106,40 @@ app.post('/start-stream', (req, res) => {
 app.post('/stop-stream', (req, res) => {
   const { sessionId } = req.body;
 
-  if (!sessionId) {
-    return res.status(400).json({ success: false, message: 'Session ID diperlukan.' });
-  }
-
   if (activeStreams[sessionId]) {
-    activeStreams[sessionId].kill('SIGTERM'); // Kirim sinyal terminate ke proses FFmpeg
+    activeStreams[sessionId].process.kill('SIGTERM'); // Menghentikan proses FFmpeg
     delete activeStreams[sessionId];
-    console.log(`[${sessionId}] Live stream dihentikan.`);
-    return res.json({ success: true, message: 'Live stream berhasil dihentikan.' });
+    return res.json({ success: true, message: 'Live stream dihentikan.' });
   }
 
-  res.json({ success: false, message: 'Tidak ada live stream yang berjalan untuk sesi ini.' });
+  res.json({ success: false, message: 'Tidak ada stream aktif.' });
 });
 
-// Endpoint untuk mendapatkan status stream (opsional)
+/**
+ * Endpoint status yang diperbarui untuk mendukung sinkronisasi frontend.
+ * Digunakan frontend untuk mengecek apakah stream masih jalan saat halaman direfresh.
+ */
 app.get('/stream-status/:sessionId', (req, res) => {
   const { sessionId } = req.params;
-  const isActive = !!activeStreams[sessionId];
-  res.json({ success: true, isActive: isActive });
+  const stream = activeStreams[sessionId];
+
+  if (stream) {
+    res.json({ 
+      success: true, 
+      isActive: true, 
+      videoName: stream.videoName, 
+      startTime: stream.startTime 
+    });
+  } else {
+    res.json({ success: true, isActive: false });
+  }
 });
 
 app.get('/', (req, res) => {
-  res.send('Railway Live Streaming Backend is Running!');
+  res.send('K-TOOL Backend is Running!');
 });
 
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
 });
+

@@ -13,35 +13,41 @@ const PORT = process.env.PORT || 8080;
 app.use(cors());
 app.use(express.json());
 
-// 1. Penanganan Folder (Solusi npm error path /app)
+// --- PENANGANAN FOLDER INTERNAL ---
 const uploadDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) {
     try {
         fs.mkdirSync(uploadDir, { recursive: true });
+        console.log("Folder uploads siap.");
     } catch (e) {
-        console.error("Folder Error:", e);
+        console.error("Gagal buat folder:", e.message);
     }
 }
 
 app.use('/uploads', express.static(uploadDir));
 const activeStreams = {};
 
-// 2. Monitoring CPU & WhatsApp Alert
-const WA_API_KEY = "API_KEY_ANDA"; // Ganti dengan API Key Anda
-const WA_NUMBER = "628xxx"; // Ganti dengan nomor WA Anda
+// --- WA NOTIFIKASI ---
+const WA_API_KEY = "API_KEY_ANDA"; 
+const WA_NUMBER = "628xxx";
 let isAlertActive = false;
 
+async function sendWANotif(msg) {
+    try {
+        await axios.get(`https://api.wa-gateway.com/send?apikey=${WA_API_KEY}&number=${WA_NUMBER}&message=${encodeURIComponent(msg)}`);
+    } catch (e) { console.log("WA Error"); }
+}
+
+// Monitoring CPU
 setInterval(() => {
     const cpuLoad = (os.loadavg()[0] * 10).toFixed(2);
     if (cpuLoad > 90 && !isAlertActive) {
-        axios.get(`https://api.wa-gateway.com/send?apikey=${WA_API_KEY}&number=${WA_NUMBER}&message=${encodeURIComponent('⚠️ Server Overload: CPU ' + cpuLoad + '%')}`).catch(e => {});
+        sendWANotif(`⚠️ Server Overload: CPU ${cpuLoad}%`);
         isAlertActive = true;
-    } else if (cpuLoad < 70) {
-        isAlertActive = false;
-    }
+    } else if (cpuLoad < 70) { isAlertActive = false; }
 }, 30000);
 
-// 3. Endpoint Status (Untuk Web Anda)
+// --- ENDPOINTS ---
 app.get('/system-stats', (req, res) => {
     res.json({
         cpuUsage: (os.loadavg()[0] * 10).toFixed(2),
@@ -51,22 +57,18 @@ app.get('/system-stats', (req, res) => {
     });
 });
 
-// 4. Proses Streaming (Optimasi Low-CPU)
 const upload = multer({ dest: 'uploads/' });
 
-app.post('/start-stream', (req, res) => {
-    const { sessionId, streamUrl, streamKey, videoPath, resolution, bitrate } = req.body;
+app.post('/start-stream', upload.single('video'), (req, res) => {
+    const { streamUrl, streamKey, resolution, bitrate } = req.body;
+    const videoPath = req.file.path;
     const streamId = Date.now().toString();
 
     const ffmpegArgs = [
-        '-re', '-stream_loop', '-1',
-        '-i', videoPath,
-        '-c:v', 'libx264', '-preset', 'ultrafast', // Sangat penting untuk Railway
-        '-tune', 'zerolatency',
-        '-b:v', bitrate || '1500k',
-        '-bufsize', '3000k',
-        '-c:a', 'aac', '-b:a', '128k',
-        '-f', 'flv', `${streamUrl}${streamKey}`
+        '-re', '-stream_loop', '-1', '-i', videoPath,
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
+        '-b:v', bitrate || '1500k', '-bufsize', '3000k',
+        '-c:a', 'aac', '-b:a', '128k', '-f', 'flv', `${streamUrl}${streamKey}`
     ];
 
     const proc = spawn('ffmpeg', ffmpegArgs);
@@ -85,15 +87,8 @@ app.post('/kill-all', (req, res) => {
     res.json({ success: true });
 });
 
-app.get('/stream-status/:sessionId', (req, res) => {
-    res.json({ success: true, streams: Object.keys(activeStreams).map(id => ({ id })) });
-});
-
-// Mencegah server mati (keep-alive)
+// Menjaga server tetap hidup
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`=================================`);
-    console.log(`SERVER LIVE STREAM PRO RUNNING`);
-    console.log(`PORT: ${PORT}`);
-    console.log(`=================================`);
+    console.log(`SERVER LIVE STREAM PRO RUNNING ON PORT ${PORT}`);
 });
 

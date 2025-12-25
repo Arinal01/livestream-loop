@@ -13,89 +13,59 @@ const PORT = process.env.PORT || 8080;
 app.use(cors());
 app.use(express.json());
 
-// --- KONFIGURASI WHATSAPP & MONITORING ---
-const WA_API_KEY = "API_KEY_ANDA"; // Masukkan API Key Anda
-const WA_NUMBER = "628xxx";       // Nomor WA Anda (format 62)
-let isAlertActive = false;
-
-// 1. Pembuatan Folder Internal (Fix npm error path /app)
+// 1. Penanganan Folder (Solusi npm error path /app)
 const uploadDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) {
     try {
         fs.mkdirSync(uploadDir, { recursive: true });
     } catch (e) {
-        console.error("Gagal buat folder:", e);
+        console.error("Folder Error:", e);
     }
 }
 
 app.use('/uploads', express.static(uploadDir));
 const activeStreams = {};
 
-// 2. Fungsi Kirim WhatsApp
-async function sendWANotif(message) {
-    try {
-        // Sesuaikan URL ini dengan dokumentasi API Gateway Anda (Contoh: Whacenter/Fowiz)
-        await axios.get(`https://api.gateway-anda.com/send?apikey=${WA_API_KEY}&to=${WA_NUMBER}&msg=${encodeURIComponent(message)}`);
-    } catch (error) {
-        console.error("WA Notif Error:", error.message);
-    }
-}
+// 2. Monitoring CPU & WhatsApp Alert
+const WA_API_KEY = "API_KEY_ANDA"; // Ganti dengan API Key Anda
+const WA_NUMBER = "628xxx"; // Ganti dengan nomor WA Anda
+let isAlertActive = false;
 
-// 3. Auto-Monitoring CPU (Tiap 30 Detik)
 setInterval(() => {
     const cpuLoad = (os.loadavg()[0] * 10).toFixed(2);
     if (cpuLoad > 90 && !isAlertActive) {
-        sendWANotif(`⚠️ ALERT: CPU Server menyentuh ${cpuLoad}%. Segera cek dashboard admin!`);
+        axios.get(`https://api.wa-gateway.com/send?apikey=${WA_API_KEY}&number=${WA_NUMBER}&message=${encodeURIComponent('⚠️ Server Overload: CPU ' + cpuLoad + '%')}`).catch(e => {});
         isAlertActive = true;
     } else if (cpuLoad < 70) {
         isAlertActive = false;
     }
 }, 30000);
 
-// 4. Endpoint Monitoring
+// 3. Endpoint Status (Untuk Web Anda)
 app.get('/system-stats', (req, res) => {
-    const totalMem = os.totalmem();
-    const freeMem = os.freemem();
     res.json({
         cpuUsage: (os.loadavg()[0] * 10).toFixed(2),
-        ramUsage: (((totalMem - freeMem) / totalMem) * 100).toFixed(2),
+        ramUsage: (((os.totalmem() - os.freemem()) / os.totalmem()) * 100).toFixed(2),
         uptime: os.uptime(),
         activeProcesses: Object.keys(activeStreams).length
     });
 });
 
-// 5. Fitur Auto-Delete
-function cleanupVideo(filePath) {
-    if (fs.existsSync(filePath)) {
-        fs.unlink(filePath, (err) => {
-            if (!err) console.log("File dibersihkan:", path.basename(filePath));
-        });
-    }
-}
-
-// 6. Streaming Logic
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, uploadDir),
-    filename: (req, file, cb) => cb(null, Date.now() + '-' + file.originalname)
-});
-const upload = multer({ storage: storage });
-
-app.post('/upload-video', upload.single('video'), (req, res) => {
-    if (!req.file) return res.status(400).send();
-    res.json({ success: true, videoUrl: req.file.path });
-});
+// 4. Proses Streaming (Optimasi Low-CPU)
+const upload = multer({ dest: 'uploads/' });
 
 app.post('/start-stream', (req, res) => {
     const { sessionId, streamUrl, streamKey, videoPath, resolution, bitrate } = req.body;
     const streamId = Date.now().toString();
-    const resMap = { "480p": "854x480", "720p": "1280x720", "1080p": "1920x1080" };
 
     const ffmpegArgs = [
-        '-re', '-stream_loop', '-1', '-i', videoPath,
-        '-s', resMap[resolution] || "1280x720",
-        '-c:v', 'libx264', '-preset', 'ultrafast', // Mode paling ringan
-        '-b:v', bitrate || '2000k', '-maxrate', bitrate || '2000k', '-bufsize', '3000k',
-        '-pix_fmt', 'yuv420p', '-g', '50', '-c:a', 'aac', '-b:a', '128k',
+        '-re', '-stream_loop', '-1',
+        '-i', videoPath,
+        '-c:v', 'libx264', '-preset', 'ultrafast', // Sangat penting untuk Railway
+        '-tune', 'zerolatency',
+        '-b:v', bitrate || '1500k',
+        '-bufsize', '3000k',
+        '-c:a', 'aac', '-b:a', '128k',
         '-f', 'flv', `${streamUrl}${streamKey}`
     ];
 
@@ -103,7 +73,7 @@ app.post('/start-stream', (req, res) => {
     activeStreams[streamId] = { process: proc, videoPath };
 
     proc.on('close', () => {
-        cleanupVideo(videoPath);
+        if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
         delete activeStreams[streamId];
     });
 
@@ -115,5 +85,15 @@ app.post('/kill-all', (req, res) => {
     res.json({ success: true });
 });
 
-app.listen(PORT, '0.0.0.0', () => console.log(`SERVER AKTIF: PORT ${PORT}`));
+app.get('/stream-status/:sessionId', (req, res) => {
+    res.json({ success: true, streams: Object.keys(activeStreams).map(id => ({ id })) });
+});
+
+// Mencegah server mati (keep-alive)
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`=================================`);
+    console.log(`SERVER LIVE STREAM PRO RUNNING`);
+    console.log(`PORT: ${PORT}`);
+    console.log(`=================================`);
+});
 

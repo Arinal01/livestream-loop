@@ -1,8 +1,6 @@
 {
   "name": "railway-stream-backend",
   "version": "1.0.0",
-  "description": "Backend Streaming for Railway with WA Notif",
-  "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },

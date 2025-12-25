@@ -1,44 +1,49 @@
 const express = require('express');
 const multer = require('multer');
 const { spawn } = require('child_process');
-const cors = require('cors');
-const dotenv = require('dotenv');
 const fs = require('fs');
 const path = require('path');
+const cors = require('cors');
 
-dotenv.config();
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080; 
 
 app.use(cors());
 app.use(express.json());
-app.use('/uploads', express.static('uploads'));
 
-// Penyimpanan stream aktif (Grup berdasarkan sessionId)
-// Struktur: { sessionId: { streamId: { process, metadata } } }
+// PERBAIKAN: Membuat folder secara internal melalui Node.js (lebih aman di Railway)
+const uploadDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadDir)) {
+    try {
+        fs.mkdirSync(uploadDir, { recursive: true });
+    } catch (err) {
+        console.error("Gagal membuat folder uploads:", err);
+    }
+}
+
+app.use('/uploads', express.static(uploadDir));
+
 const activeStreams = {};
 
 const storage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, 'uploads/'),
+    destination: (req, file, cb) => cb(null, uploadDir),
     filename: (req, file, cb) => cb(null, Date.now() + '-' + file.originalname)
 });
 const upload = multer({ storage: storage });
 
-app.post('/upload-video', upload.single('video'), (req, res) => {
-    if (!req.file) return res.status(400).json({ success: false });
-    res.json({ success: true, videoUrl: path.join(__dirname, 'uploads', req.file.filename), fileName: req.file.originalname });
-});
+// Fitur Auto-Delete: Menghapus file video setelah stream dimatikan
+function cleanupVideo(filePath) {
+    fs.unlink(filePath, (err) => {
+        if (err) console.error("Gagal menghapus file:", err);
+        else console.log("File sampah berhasil dibersihkan:", filePath);
+    });
+}
 
 app.post('/start-stream', (req, res) => {
     const { sessionId, streamUrl, streamKey, videoPath, resolution, bitrate, platform } = req.body;
-    const streamId = Date.now().toString(); // ID Unik untuk setiap profil stream
+    const streamId = Date.now().toString();
 
-    // Resolusi mapping
-    const resMap = {
-        "720p": "1280x720",
-        "1080p": "1920x1080",
-        "480p": "854x480"
-    };
+    const resMap = { "480p": "854x480", "720p": "1280x720", "1080p": "1920x1080" };
 
     const ffmpegArgs = [
         '-re', '-stream_loop', '-1',
@@ -61,29 +66,32 @@ app.post('/start-stream', (req, res) => {
     };
 
     proc.on('close', () => {
-        if (activeStreams[sessionId]) delete activeStreams[sessionId][streamId];
+        console.log(`Stream ${streamId} berhenti.`);
+        // File dihapus otomatis saat stream mati agar disk tidak penuh
+        if (activeStreams[sessionId] && activeStreams[sessionId][streamId]) {
+            cleanupVideo(activeStreams[sessionId][streamId].metadata.videoPath);
+            delete activeStreams[sessionId][streamId];
+        }
     });
 
     res.json({ success: true, streamId });
-});
-
-app.get('/stream-status/:sessionId', (req, res) => {
-    const session = activeStreams[req.params.sessionId];
-    if (!session) return res.json({ success: true, streams: [] });
-    
-    const streamList = Object.values(session).map(s => s.metadata);
-    res.json({ success: true, streams: streamList });
 });
 
 app.post('/stop-stream', (req, res) => {
     const { sessionId, streamId } = req.body;
     if (activeStreams[sessionId] && activeStreams[sessionId][streamId]) {
         activeStreams[sessionId][streamId].process.kill('SIGKILL');
-        delete activeStreams[sessionId][streamId];
+        // cleanupVideo akan dipicu oleh event 'close' di atas
         return res.json({ success: true });
     }
     res.json({ success: false });
 });
 
-app.listen(PORT, () => console.log(`Server on port ${PORT}`));
+app.get('/stream-status/:sessionId', (req, res) => {
+    const session = activeStreams[req.params.sessionId];
+    const streamList = session ? Object.values(session).map(s => s.metadata) : [];
+    res.json({ success: true, streams: streamList });
+});
+
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 

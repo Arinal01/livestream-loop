@@ -7,15 +7,16 @@ const fs = require('fs');
 const path = require('path');
 
 dotenv.config();
-
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Pastikan folder uploads ada
-const uploadDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadDir)) {
-    fs.mkdirSync(uploadDir);
-}
+app.use(cors());
+app.use(express.json());
+app.use('/uploads', express.static('uploads'));
+
+// Penyimpanan stream aktif (Grup berdasarkan sessionId)
+// Struktur: { sessionId: { streamId: { process, metadata } } }
+const activeStreams = {};
 
 const storage = multer.diskStorage({
     destination: (req, file, cb) => cb(null, 'uploads/'),
@@ -23,113 +24,66 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage: storage });
 
-// Konfigurasi CORS yang lebih kuat
-app.use(cors({
-    origin: '*',
-    methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization']
-}));
-
-app.use(express.json());
-app.use('/uploads', express.static('uploads'));
-
-// Memory storage untuk stream aktif
-const activeStreams = {};
-
-// Endpoint Upload
 app.post('/upload-video', upload.single('video'), (req, res) => {
-    if (!req.file) return res.status(400).json({ success: false, message: 'No file.' });
-    // Gunakan path absolute untuk FFmpeg agar lebih aman di Railway
-    const videoPath = path.join(__dirname, 'uploads', req.file.filename);
-    res.json({ 
-        success: true, 
-        videoUrl: videoPath,
-        fileName: req.file.originalname 
-    });
+    if (!req.file) return res.status(400).json({ success: false });
+    res.json({ success: true, videoUrl: path.join(__dirname, 'uploads', req.file.filename), fileName: req.file.originalname });
 });
 
-// Endpoint Start Stream (Mendukung Multi-Key)
 app.post('/start-stream', (req, res) => {
-    const { sessionId, streamUrl, streamKeys, videoPath, bitrate = '3000k' } = req.body;
+    const { sessionId, streamUrl, streamKey, videoPath, resolution, bitrate, platform } = req.body;
+    const streamId = Date.now().toString(); // ID Unik untuk setiap profil stream
 
-    if (!sessionId || !streamUrl || !streamKeys || !videoPath) {
-        return res.status(400).json({ success: false, message: 'Data tidak lengkap.' });
-    }
-
-    if (activeStreams[sessionId]) {
-        return res.status(400).json({ success: false, message: 'Stream sedang berjalan.' });
-    }
-
-    const processes = [];
-    const keys = Array.isArray(streamKeys) ? streamKeys : [streamKeys];
-
-    // Jalankan satu proses FFmpeg untuk setiap stream key
-    keys.forEach(key => {
-        const ffmpegProcess = spawn('ffmpeg', [
-            '-re',
-            '-stream_loop', '-1',
-            '-i', videoPath,
-            '-c:v', 'libx264',
-            '-preset', 'veryfast',
-            '-b:v', bitrate,
-            '-maxrate', bitrate,
-            '-bufsize', '6000k',
-            '-pix_fmt', 'yuv420p',
-            '-g', '50',
-            '-c:a', 'aac',
-            '-b:a', '128k',
-            '-f', 'flv',
-            `${streamUrl}${key}`
-        ]);
-
-        ffmpegProcess.stderr.on('data', (data) => console.log(`[${sessionId}] FFmpeg: ${data}`));
-        
-        ffmpegProcess.on('close', () => {
-            console.log(`[${sessionId}] Stream key ${key} closed.`);
-        });
-
-        processes.push(ffmpegProcess);
-    });
-
-    activeStreams[sessionId] = {
-        processes: processes,
-        startTime: new Date(),
-        channelCount: keys.length,
-        videoPath: videoPath
+    // Resolusi mapping
+    const resMap = {
+        "720p": "1280x720",
+        "1080p": "1920x1080",
+        "480p": "854x480"
     };
 
-    res.json({ success: true, channelCount: keys.length });
+    const ffmpegArgs = [
+        '-re', '-stream_loop', '-1',
+        '-i', videoPath,
+        '-s', resMap[resolution] || "1280x720",
+        '-c:v', 'libx264', '-preset', 'veryfast',
+        '-b:v', bitrate, '-maxrate', bitrate, '-bufsize', '4000k',
+        '-pix_fmt', 'yuv420p', '-g', '50',
+        '-c:a', 'aac', '-b:a', '128k',
+        '-f', 'flv', `${streamUrl}${streamKey}`
+    ];
+
+    const proc = spawn('ffmpeg', ffmpegArgs);
+
+    if (!activeStreams[sessionId]) activeStreams[sessionId] = {};
+    
+    activeStreams[sessionId][streamId] = {
+        process: proc,
+        metadata: { streamId, platform, resolution, bitrate, startTime: new Date(), videoPath }
+    };
+
+    proc.on('close', () => {
+        if (activeStreams[sessionId]) delete activeStreams[sessionId][streamId];
+    });
+
+    res.json({ success: true, streamId });
 });
 
-// Endpoint Status (Untuk Sinkronisasi saat Refresh)
 app.get('/stream-status/:sessionId', (req, res) => {
-    const { sessionId } = req.params;
-    const stream = activeStreams[sessionId];
-
-    if (stream) {
-        res.json({ 
-            success: true, 
-            isActive: true, 
-            startTime: stream.startTime,
-            channelCount: stream.channelCount 
-        });
-    } else {
-        res.json({ success: true, isActive: false });
-    }
+    const session = activeStreams[req.params.sessionId];
+    if (!session) return res.json({ success: true, streams: [] });
+    
+    const streamList = Object.values(session).map(s => s.metadata);
+    res.json({ success: true, streams: streamList });
 });
 
-// Endpoint Stop
 app.post('/stop-stream', (req, res) => {
-    const { sessionId } = req.body;
-    if (activeStreams[sessionId]) {
-        activeStreams[sessionId].processes.forEach(p => p.kill('SIGKILL'));
-        delete activeStreams[sessionId];
+    const { sessionId, streamId } = req.body;
+    if (activeStreams[sessionId] && activeStreams[sessionId][streamId]) {
+        activeStreams[sessionId][streamId].process.kill('SIGKILL');
+        delete activeStreams[sessionId][streamId];
         return res.json({ success: true });
     }
     res.json({ success: false });
 });
 
-app.get('/', (req, res) => res.send('K-TOOL Backend Active'));
-
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Server on port ${PORT}`));
 

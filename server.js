@@ -20,14 +20,27 @@ app.use('/uploads', express.static(uploadDir));
 
 const activeStreams = {};
 
-// --- HELPER: LOG KE CONSOLE AGAR BISA DILIHAT DI RAILWAY LOGS ---
+// --- TAMBAHAN ENDPOINT MONITORING UNTUK ADMIN ---
+app.get('/system-stats', (req, res) => {
+    const totalMem = os.totalmem();
+    const freeMem = os.freemem();
+    const usedMem = totalMem - freeMem;
+    
+    res.json({
+        success: true,
+        cpuUsage: (os.loadavg()[0] * 10).toFixed(1), // Estimasi Load CPU
+        ramUsage: ((usedMem / totalMem) * 100).toFixed(1), // Persentase RAM
+        uptime: os.uptime(), // Server Uptime dalam detik
+        activeStreamsCount: Object.keys(activeStreams).reduce((acc, key) => acc + Object.keys(activeStreams[key]).length, 0)
+    });
+});
+
 const logStream = (id, msg) => console.log(`[Stream ${id}] ${msg}`);
 
 const upload = multer({ dest: 'uploads/' });
 
 app.post('/upload-video', upload.single('video'), (req, res) => {
     if (!req.file) return res.status(400).json({ success: false });
-    // Beri nama permanen agar tidak terhapus otomatis oleh sistem tertentu
     const targetPath = path.join(uploadDir, `${Date.now()}-${req.file.originalname}`);
     fs.renameSync(req.file.path, targetPath);
     res.json({ success: true, videoUrl: targetPath });
@@ -37,24 +50,22 @@ app.post('/start-stream', (req, res) => {
     const { sessionId, streamUrl, streamKey, videoPath, resolution, bitrate, platform } = req.body;
     const streamId = Date.now().toString();
 
-    // OPTIMASI FFmpeg: Ditambahkan buffer dan reconnect flags
     const ffmpegArgs = [
         '-re',
-        '-stream_loop', '-1', // Loop selamanya
+        '-stream_loop', '-1',
         '-i', videoPath,
         '-c:v', 'libx264',
         '-preset', 'ultrafast',
         '-tune', 'zerolatency',
         '-b:v', bitrate || '2500k',
         '-maxrate', bitrate || '2500k',
-        '-bufsize', '5000k', // Buffer lebih besar agar stabil
-        '-pix_fmt', 'yuv420p', // Kompatibilitas tinggi platform
-        '-g', '60', // Keyframe interval (penting untuk YT/TikTok)
+        '-bufsize', '5000k',
+        '-pix_fmt', 'yuv420p',
+        '-g', '60',
         '-c:a', 'aac',
         '-b:a', '128k',
         '-ar', '44100',
         '-f', 'flv',
-        // Tambahkan timeout agar tidak menggantung jika platform down
         `${streamUrl}${streamKey}`
     ];
 
@@ -77,15 +88,8 @@ app.post('/start-stream', (req, res) => {
 
     logStream(streamId, `Started streaming ${platform}`);
 
-    // Pantau error dari FFmpeg
-    proc.stderr.on('data', (data) => {
-        // Uncomment baris bawah jika ingin debugging berat di Railway logs
-        // console.log(`FFMPEG LOG: ${data}`);
-    });
-
     proc.on('close', (code) => {
         logStream(streamId, `Process exited with code ${code}`);
-        // JANGAN hapus videoPath di sini jika ingin auto-restart manual nanti
         if (activeStreams[sessionId]) {
             delete activeStreams[sessionId][streamId];
         }
@@ -104,16 +108,13 @@ app.get('/stream-status/:sessionId', (req, res) => {
     res.json({ success: true, streams: streamList });
 });
 
-// FIX: Endpoint Stop-All untuk membersihkan FFmpeg yang tersangkut
-app.post('/stop-all/:sessionId', (req, res) => {
-    const { sessionId } = req.params;
-    if (activeStreams[sessionId]) {
-        Object.keys(activeStreams[sessionId]).forEach(id => {
-            activeStreams[sessionId][id].process.kill('SIGKILL');
+app.post('/kill-all', (req, res) => {
+    Object.keys(activeStreams).forEach(sessionId => {
+        Object.keys(activeStreams[sessionId]).forEach(streamId => {
+            activeStreams[sessionId][streamId].process.kill('SIGKILL');
         });
-        delete activeStreams[sessionId];
-    }
-    res.json({ success: true });
+    });
+    res.json({ success: true, message: "All processes terminated" });
 });
 
 app.post('/stop-stream', (req, res) => {
@@ -126,12 +127,13 @@ app.post('/stop-stream', (req, res) => {
     }
 });
 
-// Cleanup: Hapus file video lama yang tidak terpakai saat server restart
 const clearUploads = () => {
-    fs.readdir(uploadDir, (err, files) => {
-        if (err) return;
-        files.forEach(file => fs.unlinkSync(path.join(uploadDir, file)));
-    });
+    if (fs.existsSync(uploadDir)) {
+        fs.readdir(uploadDir, (err, files) => {
+            if (err) return;
+            files.forEach(file => fs.unlinkSync(path.join(uploadDir, file)));
+        });
+    }
 };
 clearUploads();
 

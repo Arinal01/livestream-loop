@@ -10,9 +10,11 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 
 // --- CONFIG KEAMANAN (RAILWAY VARIABLES) ---
-// Di Railway, tambahkan Variables: ADMIN_PASSWORD dan YOUTUBE_API_KEY
-const ADMIN_SECRET_PASSWORD = process.env.ADMIN_PASSWORD || 'Admin123'; 
-const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY || 'AIzaSyCXM3z54iIlcZ_OlpCWXRQ3bAuT422Gsxs';
+// Nilai di bawah ini sekarang kosong, pastikan Anda mengisi ADMIN_PASSWORD, 
+// YOUTUBE_API_KEY, dan GEMINI_API_KEY di dashboard Railway Anda.
+const ADMIN_SECRET_PASSWORD = process.env.ADMIN_PASSWORD; 
+const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
 app.use(cors());
 app.use(express.json());
@@ -32,16 +34,18 @@ const activeStreams = {};
 // Endpoint Login Dashboard Admin
 app.post('/admin-login', (req, res) => {
     const { password } = req.body;
-    if (password === ADMIN_SECRET_PASSWORD) {
+    if (password && password === ADMIN_SECRET_PASSWORD) {
         res.json({ success: true, message: "Auth Success" });
     } else {
-        res.status(401).json({ success: false, message: "Password Salah" });
+        res.status(401).json({ success: false, message: "Password Salah atau Belum Diatur" });
     }
 });
 
 // Endpoint Proxy YouTube (Menyembunyikan API Key dari Browser)
 app.get('/youtube-proxy', async (req, res) => {
     const { endpoint, q, videoId } = req.query;
+    if (!YOUTUBE_API_KEY) return res.status(500).json({ success: false, error: "API Key YouTube belum diatur di server" });
+    
     let url = "";
 
     if (endpoint === 'search') {
@@ -168,6 +172,33 @@ app.post('/stop-stream', (req, res) => {
         res.json({ success: true });
     } else {
         res.json({ success: false });
+    }
+});
+
+// ==========================================
+// NEW: AI CONTENT GENERATOR ENDPOINT
+// ==========================================
+app.post('/generate', async (req, res) => {
+    const { topic } = req.body;
+    if (!topic) return res.status(400).json({ error: "Topic is required" });
+    if (!GEMINI_API_KEY) return res.status(500).json({ error: "Gemini API Key not set" });
+
+    try {
+        const prompt = `Berperanlah sebagai pakar SEO YouTube 2025. Berikan 4 judul video viral yang berbeda gaya (Clickbait, Edukasi, Storytelling, Listicle) dan 1 deskripsi video yang mengandung SEO tinggi untuk topik: "${topic}". Format jawaban harus JSON murni tanpa markdown: {"titles": [{"tag": "VIRAL", "text": "isi judul"}, {"tag": "STRATEGY", "text": "isi judul"}, {"tag": "SECRET", "text": "isi judul"}, {"tag": "GUIDE", "text": "isi judul"}], "description": "isi deskripsi lengkap"}`;
+
+        const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
+        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+        });
+
+        const data = await response.json();
+        const aiText = data.candidates[0].content.parts[0].text;
+        const cleanJson = aiText.replace(/```json|```/g, "");
+        res.json(JSON.parse(cleanJson));
+    } catch (error) {
+        res.status(500).json({ error: "AI Generation failed", details: error.message });
     }
 });
 

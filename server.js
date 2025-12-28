@@ -10,7 +10,6 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 
 // --- CONFIG KEAMANAN (RAILWAY VARIABLES) ---
-// Nilai diambil murni dari Environment Variables Railway
 const ADMIN_SECRET_PASSWORD = process.env.ADMIN_PASSWORD; 
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
@@ -30,7 +29,6 @@ const activeStreams = {};
 // NEW: ENDPOINT UNTUK LOGIN ADMIN & PROXY
 // ==========================================
 
-// Endpoint Login Dashboard Admin
 app.post('/admin-login', (req, res) => {
     const { password } = req.body;
     if (password && password === ADMIN_SECRET_PASSWORD) {
@@ -40,7 +38,6 @@ app.post('/admin-login', (req, res) => {
     }
 });
 
-// Endpoint Proxy YouTube (Menyembunyikan API Key dari Browser)
 app.get('/youtube-proxy', async (req, res) => {
     const { endpoint, q, videoId } = req.query;
     if (!YOUTUBE_API_KEY) return res.status(500).json({ success: false, error: "API Key YouTube belum diatur" });
@@ -63,35 +60,57 @@ app.get('/youtube-proxy', async (req, res) => {
 });
 
 // ==========================================
-// NEW: AI CONTENT GENERATOR (GEMINI 2.0)
+// AI CONTENT GENERATOR WITH MULTI-MODEL FALLBACK
 // ==========================================
 app.post('/generate', async (req, res) => {
     const { topic } = req.body;
     if (!topic) return res.status(400).json({ error: "Topic is required" });
     if (!GEMINI_API_KEY) return res.status(500).json({ error: "Gemini API Key belum diatur di server" });
 
-    try {
-        const prompt = `Berperanlah sebagai pakar SEO YouTube 2025. Berikan 4 judul video viral yang berbeda gaya (Clickbait, Edukasi, Storytelling, Listicle) dan 1 deskripsi video yang mengandung SEO tinggi untuk topik: "${topic}". Jawab WAJIB dalam format JSON murni tanpa markdown: {"titles": [{"tag": "VIRAL", "text": "isi"}, {"tag": "STRATEGY", "text": "isi"}, {"tag": "SECRET", "text": "isi"}, {"tag": "GUIDE", "text": "isi"}], "description": "isi"}`;
+    // Daftar model fallback sesuai ketersediaan akun Anda
+    const allowedModels = [
+        "gemini-2.0-flash", 
+        "gemini-2.0-flash-001", 
+        "gemini-2.5-flash", 
+        "gemini-flash-latest",
+        "gemini-2.0-flash-lite",
+        "gemma-3-27b-it"
+    ];
 
-        const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
-        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
-        });
+    const prompt = `Berperanlah sebagai pakar SEO YouTube 2025. Berikan 4 judul video viral yang berbeda gaya (Clickbait, Edukasi, Storytelling, Listicle) dan 1 deskripsi video yang mengandung SEO tinggi untuk topik: "${topic}". Jawab WAJIB dalam format JSON murni tanpa markdown: {"titles": [{"tag": "VIRAL", "text": "isi"}, {"tag": "STRATEGY", "text": "isi"}, {"tag": "SECRET", "text": "isi"}, {"tag": "GUIDE", "text": "isi"}], "description": "isi"}`;
 
-        const data = await response.json();
-        
-        if (data.candidates && data.candidates.length > 0) {
-            let aiText = data.candidates[0].content.parts[0].text;
-            const cleanJson = aiText.replace(/```json|```/g, "").trim();
-            res.json(JSON.parse(cleanJson));
-        } else {
-            throw new Error(data.error?.message || "AI gagal memberikan respon");
+    const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
+    
+    let lastError = null;
+
+    // Logika Fallback: Mencoba model satu per satu jika gagal
+    for (const modelName of allowedModels) {
+        try {
+            console.log(`Mencoba generate menggunakan model: ${modelName}`);
+            const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${GEMINI_API_KEY}`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+            });
+
+            const data = await response.json();
+
+            if (data.candidates && data.candidates.length > 0) {
+                let aiText = data.candidates[0].content.parts[0].text;
+                const cleanJson = aiText.replace(/```json|```/g, "").trim();
+                return res.json(JSON.parse(cleanJson)); // Berhasil, langsung return
+            } else if (data.error) {
+                throw new Error(data.error.message);
+            }
+        } catch (error) {
+            console.warn(`Model ${modelName} gagal: ${error.message}`);
+            lastError = error.message;
+            continue; // Coba model berikutnya
         }
-    } catch (error) {
-        res.status(500).json({ error: "AI Generation failed", details: error.message });
     }
+
+    // Jika semua model gagal
+    res.status(500).json({ error: "Semua model AI gagal merespon", details: lastError });
 });
 
 // ==========================================
@@ -109,7 +128,7 @@ app.get('/system-stats', (req, res) => {
         ramUsage: ((usedMem / totalMem) * 100).toFixed(1), 
         uptime: os.uptime(), 
         activeStreamsCount: Object.keys(activeStreams).reduce((acc, key) => {
-            return acc + Object.keys(activeStreams[key]).length;
+            return acc + (activeStreams[key] ? Object.keys(activeStreams[key]).length : 0);
         }, 0)
     });
 });
@@ -188,9 +207,11 @@ app.get('/stream-status/:sessionId', (req, res) => {
 
 app.post('/kill-all', (req, res) => {
     Object.keys(activeStreams).forEach(sessionId => {
-        Object.keys(activeStreams[sessionId]).forEach(streamId => {
-            activeStreams[sessionId][streamId].process.kill('SIGKILL');
-        });
+        if (activeStreams[sessionId]) {
+            Object.keys(activeStreams[sessionId]).forEach(streamId => {
+                activeStreams[sessionId][streamId].process.kill('SIGKILL');
+            });
+        }
     });
     res.json({ success: true, message: "All processes terminated" });
 });
@@ -205,7 +226,6 @@ app.post('/stop-stream', (req, res) => {
     }
 });
 
-// CLEANUP AMAN (Pembersihan file setiap 1 jam)
 const clearUploadsSafe = () => {
     fs.readdir(uploadDir, (err, files) => {
         if (err) return;
@@ -217,7 +237,7 @@ const clearUploadsSafe = () => {
                 const endTime = new Date(stats.mtime).getTime() + (24 * 60 * 60 * 1000); 
                 
                 if (now > endTime) {
-                    fs.unlinkSync(filePath);
+                    try { fs.unlinkSync(filePath); } catch(e) {}
                 }
             }
         });

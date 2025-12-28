@@ -10,8 +10,6 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 
 // --- CONFIG KEAMANAN (RAILWAY VARIABLES) ---
-// Nilai di bawah ini sekarang kosong, pastikan Anda mengisi ADMIN_PASSWORD, 
-// YOUTUBE_API_KEY, dan GEMINI_API_KEY di dashboard Railway Anda.
 const ADMIN_SECRET_PASSWORD = process.env.ADMIN_PASSWORD; 
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
@@ -79,7 +77,7 @@ app.get('/system-stats', (req, res) => {
         ramUsage: ((usedMem / totalMem) * 100).toFixed(1), 
         uptime: os.uptime(), 
         activeStreamsCount: Object.keys(activeStreams).reduce((acc, key) => {
-            return acc + Object.keys(activeStreams[key]).length;
+            return acc + (activeStreams[key] ? Object.keys(activeStreams[key]).length : 0);
         }, 0)
     });
 });
@@ -158,9 +156,11 @@ app.get('/stream-status/:sessionId', (req, res) => {
 
 app.post('/kill-all', (req, res) => {
     Object.keys(activeStreams).forEach(sessionId => {
-        Object.keys(activeStreams[sessionId]).forEach(streamId => {
-            activeStreams[sessionId][streamId].process.kill('SIGKILL');
-        });
+        if (activeStreams[sessionId]) {
+            Object.keys(activeStreams[sessionId]).forEach(streamId => {
+                activeStreams[sessionId][streamId].process.kill('SIGKILL');
+            });
+        }
     });
     res.json({ success: true, message: "All processes terminated" });
 });
@@ -194,9 +194,15 @@ app.post('/generate', async (req, res) => {
         });
 
         const data = await response.json();
-        const aiText = data.candidates[0].content.parts[0].text;
-        const cleanJson = aiText.replace(/```json|```/g, "");
-        res.json(JSON.parse(cleanJson));
+        
+        if (data.candidates && data.candidates[0].content.parts[0].text) {
+            let aiText = data.candidates[0].content.parts[0].text;
+            // Membersihkan markdown jika AI tetap menyertakannya
+            const cleanJson = aiText.replace(/```json|```/g, "").trim();
+            res.json(JSON.parse(cleanJson));
+        } else {
+            throw new Error("Invalid AI response");
+        }
     } catch (error) {
         res.status(500).json({ error: "AI Generation failed", details: error.message });
     }
@@ -208,12 +214,14 @@ const clearUploadsSafe = () => {
         if (err) return;
         files.forEach(file => {
             const filePath = path.join(uploadDir, file);
-            const stats = fs.statSync(filePath);
-            const now = new Date().getTime();
-            const endTime = new Date(stats.mtime).getTime() + (24 * 60 * 60 * 1000); 
-            
-            if (now > endTime) {
-                fs.unlinkSync(filePath);
+            if (fs.existsSync(filePath)) {
+                const stats = fs.statSync(filePath);
+                const now = new Date().getTime();
+                const endTime = new Date(stats.mtime).getTime() + (24 * 60 * 60 * 1000); 
+                
+                if (now > endTime) {
+                    fs.unlinkSync(filePath);
+                }
             }
         });
     });
